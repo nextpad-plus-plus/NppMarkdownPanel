@@ -1,0 +1,11 @@
+# macOS metadata
+.DS_Store
+
+# CMake build output
+build/
+
+# Scratch / investigation notes
+/tmp
+
+# Temp preview files created alongside markdown files
+.npp-md-preview.html
