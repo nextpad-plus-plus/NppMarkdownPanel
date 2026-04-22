@@ -50,8 +50,19 @@ static MarkdownSettings sSettings;
 //  Plugin state
 // ═══════════════════════════════════════════════════════════════════════════
 
-static NSPanel *sPanel = nil;
-static WKWebView *sWebView = nil;
+// Content view — the NSView we register with the host via
+// NPPM_DMM_REGISTERPANEL. It owns the WKWebView; it lives either inside
+// the host's SidePanelHost (docked) or inside g_floatingPanel.contentView
+// (floating fallback for older hosts without the docking API).
+static NSView       *sContentView  = nil;
+static WKWebView    *sWebView      = nil;
+
+// Docking state. Exactly one of these is active after first show:
+//   g_panelHandle > 0  → host accepted NPPM_DMM_REGISTERPANEL; docked path
+//   g_floatingPanel    → host doesn't support docking; NSPanel fallback
+static uint64_t      g_panelHandle  = 0;
+static NSPanel      *g_floatingPanel = nil;
+
 static bool sPanelVisible = false;
 static bool sTemplateLoaded = false;
 static std::string sLastRenderedText;
@@ -71,6 +82,9 @@ static void showAboutCmd();
 static void exportToHtmlCmd();
 static void renderMarkdownDirect();
 static void renderMarkdownDeferred();
+static void ensureContentView();
+static NSPanel *ensureFloatingPanel();
+static BOOL markdownPanelIsShown();
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -234,6 +248,13 @@ li + li { margin-top: 0.25em; }
 input[type="checkbox"] { margin-right: 0.5em; }
 /* YAML frontmatter displayed as code */
 .frontmatter { background: var(--color-code-bg); padding: 12px 16px; border-radius: 6px; margin-bottom: 24px; font-size: 85%; font-family: monospace; color: var(--color-blockquote); border-left: 4px solid var(--color-border); white-space: pre-wrap; }
+/* In-document search highlight — applied by highlightMatches() below */
+mark.npp-find { background: #ffeb3b; color: #000; padding: 0 2px; border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,0.1); }
+mark.npp-find.current { background: #ff9800; box-shadow: 0 0 0 2px rgba(255,152,0,0.35); }
+@media (prefers-color-scheme: dark) {
+  mark.npp-find { background: #ffd54f; color: #000; }
+  mark.npp-find.current { background: #ffb300; }
+}
 )CSS";
 
 static void buildTemplate() {
@@ -336,6 +357,104 @@ function renderMarkdown(md) {
   }
 
   window._totalLines = md.split('\n').length;
+
+  // Re-apply the search highlight after a re-render so the selection
+  // survives typing in the editor. Native code updates window._searchQuery
+  // via highlightMatches(); if it's non-empty we run the highlighter again.
+  if (window._searchQuery) {
+    highlightMatches(window._searchQuery);
+  }
+}
+
+// ───────────────────── In-document search ─────────────────────
+// Wrap every case-insensitive match of `query` in <mark class="npp-find">
+// and scroll the first hit into view. Called natively on every keystroke
+// (after a 120ms debounce) and again after each re-render.
+//
+// Implementation uses a TreeWalker over TEXT nodes, skipping anything
+// inside <script>/<style>/<pre><code> so we don't mangle highlighted
+// source blocks or break highlight.js output. Regex metachars in the
+// query are escaped so the user can search for literal characters like
+// "." or "(".
+window._searchQuery = '';
+function _escRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function _clearHighlights() {
+  var marks = document.querySelectorAll('mark.npp-find');
+  marks.forEach(function(m) {
+    var parent = m.parentNode;
+    if (!parent) return;
+    while (m.firstChild) parent.insertBefore(m.firstChild, m);
+    parent.removeChild(m);
+    parent.normalize();
+  });
+}
+
+function highlightMatches(query) {
+  _clearHighlights();
+  window._searchQuery = query || '';
+  if (!query) return 0;
+
+  var re = new RegExp(_escRegex(query), 'gi');
+  var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode: function(node) {
+      if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+      var p = node.parentElement;
+      while (p) {
+        var tag = p.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE') return NodeFilter.FILTER_REJECT;
+        // Allow highlighting inside <code> / <pre> but skip if that's already
+        // inside a hljs-processed span chain — we'd break the coloring.
+        if (p.classList && p.classList.contains('hljs')) return NodeFilter.FILTER_REJECT;
+        p = p.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  // Collect first so we don't mutate mid-walk.
+  var targets = [];
+  var n;
+  while ((n = walker.nextNode())) {
+    if (re.test(n.nodeValue)) targets.push(n);
+    re.lastIndex = 0;
+  }
+
+  var count = 0;
+  targets.forEach(function(node) {
+    var text = node.nodeValue;
+    var frag = document.createDocumentFragment();
+    var lastIdx = 0;
+    var m;
+    re.lastIndex = 0;
+    while ((m = re.exec(text))) {
+      if (m.index > lastIdx) {
+        frag.appendChild(document.createTextNode(text.slice(lastIdx, m.index)));
+      }
+      var mark = document.createElement('mark');
+      mark.className = 'npp-find';
+      mark.textContent = m[0];
+      frag.appendChild(mark);
+      lastIdx = re.lastIndex;
+      count++;
+      // Guard against zero-width match infinite loop (shouldn't happen
+      // with escaped regex, but defend anyway).
+      if (m.index === re.lastIndex) re.lastIndex++;
+    }
+    if (lastIdx < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+    }
+    if (node.parentNode) node.parentNode.replaceChild(frag, node);
+  });
+
+  // Scroll the first hit to the middle of the viewport, non-smooth because
+  // typists may be iterating and smooth scroll queues multiple animations.
+  var first = document.querySelector('mark.npp-find');
+  if (first) {
+    first.classList.add('current');
+    first.scrollIntoView({block: 'center', inline: 'nearest'});
+  }
+  return count;
 }
 
 // Scroll sync: proportional by document height (smooth, no jumping)
@@ -441,6 +560,248 @@ static void saveSettings() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Toolbar-row helpers: search field delegate + panel-style button
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Forward declaration — button knows how to reload its icon on dark-mode flip.
+@class _NMPPanelButton;
+
+// Panel-toolbar button matching the host's _FTPanelButton style
+// (FolderTreePanel.mm): 16×16 bounds, NO border at rest, toolbar-blue fill +
+// border on hover/press (fill skipped in dark mode), image drawn centered
+// at intrinsic size. Icon comes from the plugin's bundled resources and
+// swaps on light/dark appearance changes.
+@interface _NMPPanelButton : NSButton {
+    BOOL _hovering;
+}
+@property (nonatomic, copy) NSString *lightIconName;  // basename w/o .png
+@property (nonatomic, copy) NSString *darkIconName;
+- (void)reloadIcon;
+@end
+
+@implementation _NMPPanelButton
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        self.translatesAutoresizingMaskIntoConstraints = NO;
+        self.bordered = NO;
+        [self setButtonType:NSButtonTypeMomentaryChange];
+        [self.widthAnchor  constraintEqualToConstant:16].active = YES;
+        [self.heightAnchor constraintEqualToConstant:16].active = YES;
+        NSTrackingArea *ta = [[NSTrackingArea alloc]
+            initWithRect:NSZeroRect
+                 options:(NSTrackingMouseEnteredAndExited |
+                          NSTrackingActiveInActiveApp |
+                          NSTrackingInVisibleRect)
+                   owner:self userInfo:nil];
+        [self addTrackingArea:ta];
+    }
+    return self;
+}
+
+- (void)mouseEntered:(NSEvent *)event { _hovering = YES;  [self setNeedsDisplay:YES]; }
+- (void)mouseExited:(NSEvent *)event  { _hovering = NO;   [self setNeedsDisplay:YES]; }
+
+- (BOOL)_isDark {
+    if (@available(macOS 10.14, *)) {
+        NSAppearanceName match = [self.effectiveAppearance
+            bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua,
+                                                 NSAppearanceNameDarkAqua]];
+        return [match isEqualToString:NSAppearanceNameDarkAqua];
+    }
+    return NO;
+}
+
+- (void)reloadIcon {
+    NSString *name = [self _isDark] ? _darkIconName : _lightIconName;
+    if (!name.length) return;
+    NSString *path = [NSString stringWithFormat:@"%s/%@.png",
+                      sResourcesDir.c_str(), name];
+    NSImage *img = [[NSImage alloc] initWithContentsOfFile:path];
+    if (img) {
+        // 11pt rendered size matches FolderTreePanel's kFTToolbarIconSize
+        // — the image's own PNG is high-res; we down-render at 11pt.
+        img.size = NSMakeSize(11, 11);
+        self.image = img;
+    }
+    [self setNeedsDisplay:YES];
+}
+
+- (void)viewDidChangeEffectiveAppearance {
+    [super viewDidChangeEffectiveAppearance];
+    [self reloadIcon];
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    BOOL pressed = self.isHighlighted;
+    BOOL active  = pressed || _hovering;
+    BOOL isDark  = [self _isDark];
+
+    if (active) {
+        if (!isDark) {
+            NSColor *bg = pressed
+                ? [NSColor colorWithRed:0xCC/255.0 green:0xE8/255.0 blue:0xFF/255.0 alpha:1.0]
+                : [NSColor colorWithRed:0xE5/255.0 green:0xF3/255.0 blue:0xFF/255.0 alpha:1.0];
+            [bg setFill];
+            NSRectFill(self.bounds);
+        }
+        NSColor *bdr = [NSColor colorWithRed:0xD0/255.0 green:0xEA/255.0 blue:0xFF/255.0 alpha:1.0];
+        NSBezierPath *border = [NSBezierPath bezierPathWithRect:NSInsetRect(self.bounds, 0.5, 0.5)];
+        border.lineWidth = 1.0;
+        [bdr setStroke];
+        [border stroke];
+    }
+
+    if (self.image) {
+        NSSize isz = self.image.size;
+        NSRect ir = NSMakeRect(NSMidX(self.bounds) - isz.width / 2.0,
+                               NSMidY(self.bounds) - isz.height / 2.0,
+                               isz.width, isz.height);
+        [self.image drawInRect:ir
+                      fromRect:NSZeroRect
+                     operation:NSCompositingOperationSourceOver
+                      fraction:1.0
+                respectFlipped:YES
+                         hints:nil];
+    }
+}
+
+@end
+
+// Search-field delegate: debounces keystrokes and re-runs the highlighter.
+// Lives as a single static instance — all sessions share one delegate.
+@interface _NMPSearchFieldDelegate : NSObject <NSTextFieldDelegate>
+@end
+
+// Static forward declarations for the two C functions the delegate calls.
+static void markdownApplySearchQuery(NSString *query);
+static void printMarkdownPreview();
+
+@implementation _NMPSearchFieldDelegate
+
+- (void)controlTextDidChange:(NSNotification *)note {
+    NSTextField *tf = note.object;
+    markdownApplySearchQuery(tf.stringValue ?: @"");
+}
+
+// Cancel button in the field (Escape clears)
+- (BOOL)control:(NSControl *)control textView:(NSTextView *)fieldEditor
+     doCommandBySelector:(SEL)cmd {
+    if (cmd == @selector(cancelOperation:)) {
+        NSTextField *tf = (NSTextField *)control;
+        if (tf.stringValue.length) {
+            tf.stringValue = @"";
+            markdownApplySearchQuery(@"");
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Print button forwards here — keeps the action receiver in ObjC while the
+// actual work happens in a C function that has access to the static state
+// (sWebView, etc.) without bridging.
++ (void)_doPrint { printMarkdownPreview(); }
+
+@end
+
+// Shared state the toolbar-row functions below read/write. Declared before
+// the first use so markdownApplySearchQuery() compiles without a forward
+// decl shuffle.
+static _NMPSearchFieldDelegate *sSearchDelegate = nil;
+static NSTextField             *sSearchField    = nil;
+static _NMPPanelButton         *sPrintButton    = nil;
+
+// Latest search query, kept so we can reapply after every re-render. Non-
+// empty only while the user has typed into the search field.
+static std::string sCurrentSearchText;
+
+// Debounce handle for keystroke → JS highlight propagation.
+static dispatch_block_t sPendingSearch = nil;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JS-escape a plain string for safe embedding inside a JS single-quoted
+// string literal. Escapes: backslash, single quote, CR, LF, paragraph &
+// line separators (U+2028/U+2029 would otherwise end a JS line).
+// ─────────────────────────────────────────────────────────────────────────────
+static NSString *jsEscapeSingleQuote(NSString *s) {
+    if (!s) return @"";
+    NSMutableString *out = [NSMutableString stringWithCapacity:s.length];
+    [s enumerateSubstringsInRange:NSMakeRange(0, s.length)
+                          options:NSStringEnumerationByComposedCharacterSequences
+                       usingBlock:^(NSString *sub, NSRange r, NSRange er, BOOL *stop) {
+        if ([sub isEqualToString:@"\\"])      [out appendString:@"\\\\"];
+        else if ([sub isEqualToString:@"'"])  [out appendString:@"\\'"];
+        else if ([sub isEqualToString:@"\n"]) [out appendString:@"\\n"];
+        else if ([sub isEqualToString:@"\r"]) [out appendString:@"\\r"];
+        else if ([sub isEqualToString:@"\u2028"]) [out appendString:@"\\u2028"];
+        else if ([sub isEqualToString:@"\u2029"]) [out appendString:@"\\u2029"];
+        else                                  [out appendString:sub];
+    }];
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debounced live search. Every keystroke cancels the pending dispatch and
+// queues a fresh one 120ms later, so a fast typist doesn't pay per-key.
+// Empty query clears the highlights in the WKWebView.
+// ─────────────────────────────────────────────────────────────────────────────
+static void markdownApplySearchQuery(NSString *query) {
+    sCurrentSearchText = query ? std::string([query UTF8String]) : std::string();
+
+    if (sPendingSearch) {
+        dispatch_block_cancel(sPendingSearch);
+        sPendingSearch = nil;
+    }
+    // Snapshot the query for the block — user may keep typing before fire.
+    NSString *captured = [query copy] ?: @"";
+    sPendingSearch = dispatch_block_create(DISPATCH_BLOCK_INHERIT_QOS_CLASS, ^{
+        if (!sWebView) return;
+        @autoreleasepool {
+            NSString *escaped = jsEscapeSingleQuote(captured);
+            NSString *js = [NSString stringWithFormat:
+                @"if (typeof highlightMatches === 'function') highlightMatches('%@');",
+                escaped];
+            [sWebView evaluateJavaScript:js completionHandler:nil];
+        }
+        sPendingSearch = nil;
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), sPendingSearch);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Print: hand off to WKWebView's native print operation. Runs as a sheet
+// on whichever window currently hosts sContentView (main app when docked,
+// FloatingPanelWindow when popped out, g_floatingPanel as fallback).
+// ─────────────────────────────────────────────────────────────────────────────
+static void printMarkdownPreview() {
+    if (!sWebView) return;
+    NSWindow *host = sContentView.window ?: g_floatingPanel;
+    if (!host) return;  // Nothing to attach a print sheet to
+
+    @autoreleasepool {
+        NSPrintInfo *info = [[NSPrintInfo sharedPrintInfo] copy];
+        info.topMargin    = 36;
+        info.bottomMargin = 36;
+        info.leftMargin   = 36;
+        info.rightMargin  = 36;
+        info.horizontalPagination = NSPrintingPaginationModeAutomatic;
+        info.verticalPagination   = NSPrintingPaginationModeAutomatic;
+
+        NSPrintOperation *op = [sWebView printOperationWithPrintInfo:info];
+        op.showsPrintPanel    = YES;
+        op.showsProgressPanel = YES;
+        op.jobTitle           = @"Markdown Preview";
+        [op runOperationModalForWindow:host
+                              delegate:nil
+                        didRunSelector:NULL
+                           contextInfo:NULL];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  WKWebView panel
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -468,28 +829,113 @@ static void saveSettings() {
 
 static MarkdownNavigationDelegate *sNavDelegate = nil;
 
-static void createPanel() {
-    if (sPanel) return;
+// Build (once) the NSView that wraps the search/print toolbar row + the
+// WKWebView. Used by both the docked path (registered via
+// NPPM_DMM_REGISTERPANEL) and the floating fallback (installed as the
+// NSPanel's contentView). Same NSView instance is reused — it moves
+// between hosting windows without being rebuilt.
+//
+// Layout (matches FunctionListPanel.mm's search-row pattern):
+//   [search field ▸ expandable] [print button 16×16]
+//   ─────────────────────────────────────────────────
+//   [WKWebView — fills the rest]
+static void ensureContentView() {
+    if (sContentView) return;
+
+    @autoreleasepool {
+        // Initial frame is only meaningful for the floating fallback — the
+        // host sizes the view to the side-panel stack when docked. 500×700
+        // matches the old NSPanel default so first-time floating users see
+        // the same geometry as before.
+        sContentView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 500, 700)];
+
+        // ── Search field ───────────────────────────────────────────────
+        sSearchField = [[NSTextField alloc] init];
+        sSearchField.translatesAutoresizingMaskIntoConstraints = NO;
+        sSearchField.placeholderString = @"Search in document...";
+        sSearchField.font = [NSFont systemFontOfSize:11];
+        sSearchField.bezelStyle = NSTextFieldRoundedBezel;
+        [[sSearchField cell] setScrollable:YES];
+        sSearchDelegate = [[_NMPSearchFieldDelegate alloc] init];
+        sSearchField.delegate = sSearchDelegate;
+        [sContentView addSubview:sSearchField];
+
+        // ── Print button ───────────────────────────────────────────────
+        sPrintButton = [[_NMPPanelButton alloc] init];
+        sPrintButton.lightIconName = @"print_light";
+        sPrintButton.darkIconName  = @"print_dark";
+        sPrintButton.toolTip       = @"Print preview";
+        sPrintButton.target        = [_NMPSearchFieldDelegate class];
+        // Use a static dispatcher (class method on the delegate) so the
+        // action lives in Objective-C even though the actual work is a
+        // C function call. See +_doPrint below.
+        sPrintButton.action        = @selector(_doPrint);
+        [sPrintButton reloadIcon];
+        [sContentView addSubview:sPrintButton];
+
+        // ── WKWebView ──────────────────────────────────────────────────
+        WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
+        config.defaultWebpagePreferences.allowsContentJavaScript = YES;
+
+        sWebView = [[WKWebView alloc] initWithFrame:NSZeroRect
+                                       configuration:config];
+        sWebView.translatesAutoresizingMaskIntoConstraints = NO;
+
+        sNavDelegate = [[MarkdownNavigationDelegate alloc] init];
+        sWebView.navigationDelegate = sNavDelegate;
+
+        [sContentView addSubview:sWebView];
+
+        // ── Constraints ────────────────────────────────────────────────
+        [NSLayoutConstraint activateConstraints:@[
+            // Search field: 4pt top gap, 6pt leading gutter, 6pt gap to
+            // print button; 22pt tall (matches FunctionList row height).
+            [sSearchField.topAnchor      constraintEqualToAnchor:sContentView.topAnchor constant:4],
+            [sSearchField.leadingAnchor  constraintEqualToAnchor:sContentView.leadingAnchor constant:6],
+            [sSearchField.trailingAnchor constraintEqualToAnchor:sPrintButton.leadingAnchor constant:-6],
+            [sSearchField.heightAnchor   constraintEqualToConstant:22],
+
+            // Print button — 16×16 (width/height constraints added in init)
+            [sPrintButton.trailingAnchor constraintEqualToAnchor:sContentView.trailingAnchor constant:-6],
+            [sPrintButton.centerYAnchor  constraintEqualToAnchor:sSearchField.centerYAnchor],
+
+            // WebView fills below the toolbar row, flush to edges.
+            [sWebView.topAnchor      constraintEqualToAnchor:sSearchField.bottomAnchor constant:4],
+            [sWebView.leadingAnchor  constraintEqualToAnchor:sContentView.leadingAnchor],
+            [sWebView.trailingAnchor constraintEqualToAnchor:sContentView.trailingAnchor],
+            [sWebView.bottomAnchor   constraintEqualToAnchor:sContentView.bottomAnchor],
+        ]];
+    }
+}
+
+// Build (lazily) the floating NSPanel used as the fallback when the host
+// doesn't support NPPM_DMM_* docking. sContentView becomes the panel's
+// content view. Close via the red traffic light is caught by an
+// NSWindowWillCloseNotification observer scoped to this panel only —
+// the docked path detects close via a runtime isShown check instead.
+static NSPanel *ensureFloatingPanel() {
+    if (g_floatingPanel) return g_floatingPanel;
+    ensureContentView();
 
     @autoreleasepool {
         NSRect frame = NSMakeRect(100, 100, 500, 700);
-        sPanel = [[NSPanel alloc] initWithContentRect:frame
-                                            styleMask:NSWindowStyleMaskTitled |
-                                                      NSWindowStyleMaskClosable |
-                                                      NSWindowStyleMaskResizable |
-                                                      NSWindowStyleMaskUtilityWindow
-                                              backing:NSBackingStoreBuffered
-                                                defer:NO];
-        [sPanel setTitle:@"Markdown Panel"];
-        [sPanel setFloatingPanel:NO];           // Standard window — goes behind when another app is focused
-        [sPanel setHidesOnDeactivate:NO];
-        [sPanel setReleasedWhenClosed:NO];
-        [sPanel setLevel:NSNormalWindowLevel];   // Same level as all other windows
+        NSUInteger mask = NSWindowStyleMaskTitled    |
+                          NSWindowStyleMaskClosable  |
+                          NSWindowStyleMaskResizable |
+                          NSWindowStyleMaskUtilityWindow;
+        g_floatingPanel = [[NSPanel alloc] initWithContentRect:frame
+                                                      styleMask:mask
+                                                        backing:NSBackingStoreBuffered
+                                                          defer:NO];
+        [g_floatingPanel setTitle:@"Markdown Panel"];
+        [g_floatingPanel setFloatingPanel:NO];
+        [g_floatingPanel setHidesOnDeactivate:NO];
+        [g_floatingPanel setReleasedWhenClosed:NO];
+        [g_floatingPanel setLevel:NSNormalWindowLevel];
 
-        // Handle panel close via the X button
         [[NSNotificationCenter defaultCenter]
             addObserverForName:NSWindowWillCloseNotification
-                       object:sPanel
+                       object:g_floatingPanel
                         queue:nil
                    usingBlock:^(NSNotification *note) {
                        sPanelVisible = false;
@@ -497,29 +943,40 @@ static void createPanel() {
                                             (uintptr_t)funcItem[0]._cmdID, 0);
                    }];
 
-        // WKWebView with file access
-        WKWebViewConfiguration *config = [[WKWebViewConfiguration alloc] init];
-        config.defaultWebpagePreferences.allowsContentJavaScript = YES;
+        // Install sContentView to fill the NSPanel's content area.
+        sContentView.frame = ((NSView *)g_floatingPanel.contentView).bounds;
+        sContentView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [g_floatingPanel.contentView addSubview:sContentView];
 
-        sWebView = [[WKWebView alloc] initWithFrame:sPanel.contentView.bounds configuration:config];
-        sWebView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-
-        sNavDelegate = [[MarkdownNavigationDelegate alloc] init];
-        sWebView.navigationDelegate = sNavDelegate;
-
-        [sPanel.contentView addSubview:sWebView];
-
-        // Position to the right of the main window
+        // First-time placement: to the right of the main window, matching
+        // its height — preserves the original pre-docking UX.
         NSWindow *mainWin = [NSApp mainWindow];
         if (mainWin) {
             NSRect mainFrame = mainWin.frame;
-            NSRect panelFrame = sPanel.frame;
+            NSRect panelFrame = g_floatingPanel.frame;
             panelFrame.origin.x = NSMaxX(mainFrame) + 4;
             panelFrame.origin.y = mainFrame.origin.y;
             panelFrame.size.height = mainFrame.size.height;
-            [sPanel setFrame:panelFrame display:NO];
+            [g_floatingPanel setFrame:panelFrame display:NO];
         }
     }
+    return g_floatingPanel;
+}
+
+// Runtime check — is the preview currently rendered somewhere?
+//   docked:   sContentView has a window AND a superview (i.e. it's in
+//             the host's SidePanelHost stack OR a popped FloatingPanelWindow)
+//   floating: g_floatingPanel.isVisible
+// Used to detect host-initiated hides (e.g. user clicks the PanelFrame X,
+// which gives the plugin no callback) so the menu toggle self-corrects.
+static BOOL markdownPanelIsShown() {
+    if (g_panelHandle > 0) {
+        return sContentView != nil &&
+               sContentView.window != nil &&
+               sContentView.superview != nil;
+    }
+    if (g_floatingPanel) return g_floatingPanel.isVisible;
+    return NO;
 }
 
 static void loadTemplateIntoWebView() {
@@ -703,16 +1160,44 @@ static void syncScroll() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 static void togglePanel() {
-    if (!sPanel) {
-        createPanel();
-        buildTemplate();
+    ensureContentView();
+    if (sFullTemplate.empty()) buildTemplate();
+
+    // First toggle after launch: try NPPM_DMM_REGISTERPANEL. A nonzero
+    // return = host supports docking (v1.0.2+); cache the handle and use
+    // the docked path for the lifetime of this plugin. Zero = older host,
+    // fall back to the floating NSPanel.
+    if (g_panelHandle == 0 && g_floatingPanel == nil) {
+        intptr_t h = nppData._sendMessage(nppData._nppHandle,
+                                          NPPM_DMM_REGISTERPANEL,
+                                          (uintptr_t)(__bridge void *)sContentView,
+                                          (intptr_t)"Markdown Panel");
+        if (h > 0) {
+            g_panelHandle = (uint64_t)h;
+        } else {
+            ensureFloatingPanel();
+        }
     }
 
-    sPanelVisible = !sPanelVisible;
-    npp(NPPM_SETMENUITEMCHECK, (uintptr_t)funcItem[0]._cmdID, sPanelVisible ? 1 : 0);
+    // Target the OPPOSITE of the actual current state — this self-corrects
+    // when the user has closed the panel through the host's PanelFrame X
+    // (docked) without the plugin being notified: our cached sPanelVisible
+    // might say "shown", but markdownPanelIsShown reads the live hierarchy
+    // and returns NO, so we'll show again on next toggle.
+    BOOL currentlyShown = markdownPanelIsShown();
+    BOOL targetShown    = !currentlyShown;
 
-    if (sPanelVisible) {
-        [sPanel orderFront:nil];
+    sPanelVisible = targetShown;
+    npp(NPPM_SETMENUITEMCHECK, (uintptr_t)funcItem[0]._cmdID, targetShown ? 1 : 0);
+
+    if (targetShown) {
+        if (g_panelHandle > 0) {
+            nppData._sendMessage(nppData._nppHandle,
+                                 NPPM_DMM_SHOWPANEL,
+                                 (uintptr_t)g_panelHandle, 0);
+        } else if (g_floatingPanel) {
+            [g_floatingPanel orderFront:nil];
+        }
         sCurrentFilePath.clear(); // Force baseURL update
         sLastRenderedText.clear();
         loadTemplateIntoWebView();
@@ -721,7 +1206,13 @@ static void togglePanel() {
             renderMarkdownDirect();
         });
     } else {
-        [sPanel orderOut:nil];
+        if (g_panelHandle > 0) {
+            nppData._sendMessage(nppData._nppHandle,
+                                 NPPM_DMM_HIDEPANEL,
+                                 (uintptr_t)g_panelHandle, 0);
+        } else if (g_floatingPanel) {
+            [g_floatingPanel orderOut:nil];
+        }
     }
 }
 
@@ -1017,12 +1508,29 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
                                error:nil];
                 sCurrentTempHtmlPath.clear();
             }
-            if (sPanel) {
-                [sPanel close];
-                sPanel = nil;
-                sWebView = nil;
-                sNavDelegate = nil;
+            // Release the host's retain on sContentView before the dylib
+            // is unloaded — harmless if we never registered (older host,
+            // floating path). Matches XmlNavigator's shutdown pattern.
+            if (g_panelHandle > 0) {
+                nppData._sendMessage(nppData._nppHandle,
+                                     NPPM_DMM_UNREGISTERPANEL,
+                                     (uintptr_t)g_panelHandle, 0);
+                g_panelHandle = 0;
             }
+            if (g_floatingPanel) {
+                [g_floatingPanel close];
+                g_floatingPanel = nil;
+            }
+            if (sPendingSearch) {
+                dispatch_block_cancel(sPendingSearch);
+                sPendingSearch = nil;
+            }
+            sSearchField    = nil;
+            sPrintButton    = nil;
+            sSearchDelegate = nil;
+            sContentView    = nil;
+            sWebView        = nil;
+            sNavDelegate    = nil;
             break;
 
         default:
