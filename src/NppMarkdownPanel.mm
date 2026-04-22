@@ -40,7 +40,7 @@ struct MarkdownSettings {
     bool syncWithCaret = true;
     bool syncWithFirstVisibleLine = false;
     bool allowAllExtensions = false;
-    std::string supportedExtensions = "md,mkd,mdwn,mdown,mdtxt,markdown";
+    std::string supportedExtensions = "md,mkd,mdwn,mdown,mdtxt,markdown,mmd";
     bool enableMermaid = false;
 };
 
@@ -408,6 +408,16 @@ static void loadSettings() {
         if ((v = dict[@"allowAllExtensions"])) sSettings.allowAllExtensions = [v boolValue];
         if ((s = dict[@"supportedExtensions"])) sSettings.supportedExtensions = [s UTF8String];
         if ((v = dict[@"enableMermaid"])) sSettings.enableMermaid = [v boolValue];
+
+        // Migration: ensure .mmd is in the supported extensions list
+        {
+            std::string exts = sSettings.supportedExtensions;
+            std::string lower = exts;
+            for (auto &c : lower) c = tolower(c);
+            if (lower.find("mmd") == std::string::npos) {
+                sSettings.supportedExtensions += ",mmd";
+            }
+        }
     }
 }
 
@@ -471,10 +481,10 @@ static void createPanel() {
                                               backing:NSBackingStoreBuffered
                                                 defer:NO];
         [sPanel setTitle:@"Markdown Panel"];
-        [sPanel setFloatingPanel:YES];
+        [sPanel setFloatingPanel:NO];           // Standard window — goes behind when another app is focused
         [sPanel setHidesOnDeactivate:NO];
         [sPanel setReleasedWhenClosed:NO];
-        [sPanel setLevel:NSFloatingWindowLevel - 1]; // Below floating but above normal
+        [sPanel setLevel:NSNormalWindowLevel];   // Same level as all other windows
 
         // Handle panel close via the X button
         [[NSNotificationCenter defaultCenter]
@@ -588,6 +598,15 @@ static void renderMarkdownDirect() {
     std::string text = getEditorText();
     if (text == sLastRenderedText) return; // No change
     sLastRenderedText = text;
+
+    // Standalone .mmd files: wrap the entire content in a ```mermaid fence
+    // so marked.js passes it to the Mermaid renderer
+    std::string ext = getCurrentExtension();
+    if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+    for (auto &c : ext) c = tolower(c);
+    if (ext == "mmd") {
+        text = "```mermaid\n" + text + "\n```\n";
+    }
 
     // Check if baseURL needs updating (file path changed)
     std::string newPath = getCurrentFilePath();
