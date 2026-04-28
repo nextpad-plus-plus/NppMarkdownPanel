@@ -38,7 +38,7 @@ struct MarkdownSettings {
     int zoomLevel = 100;
     bool autoShowPanel = false;
     bool syncWithCaret = true;
-    bool syncWithFirstVisibleLine = false;
+    bool syncWithFirstVisibleLine = true;
     bool allowAllExtensions = false;
     std::string supportedExtensions = "md,mkd,mdwn,mdown,mdtxt,markdown,mmd";
     bool enableMermaid = false;
@@ -716,6 +716,21 @@ static void loadSettings() {
                 sSettings.supportedExtensions += ",mmd";
             }
         }
+
+        // Migration: the two sync modes used to be mutually exclusive
+        // (toggling one auto-disabled the other). After moving to
+        // independent toggles, users upgrading from an older build
+        // would have exactly one of the two enabled — meaning the
+        // other trigger (click → caret-line, or wheel → first-visible
+        // line) silently produced no preview update. If the saved
+        // config has at least one enabled, force both on so the new
+        // independent behavior is the default. Users who explicitly
+        // disable one via the menu still get their choice persisted
+        // on next save.
+        if (sSettings.syncWithCaret || sSettings.syncWithFirstVisibleLine) {
+            sSettings.syncWithCaret           = true;
+            sSettings.syncWithFirstVisibleLine = true;
+        }
     }
 }
 
@@ -1294,7 +1309,17 @@ static void renderMarkdownDeferred() {
 //  Scroll synchronization
 // ═══════════════════════════════════════════════════════════════════════════
 
-static intptr_t sLastSyncLine = -1;
+// Track BOTH the last caret line and the last first-visible line so a
+// click that moves the caret without scrolling, and a wheel-scroll
+// that moves the viewport without moving the caret, both trigger a
+// preview sync. Earlier versions tracked only one of the two and
+// chose based on a mutually-exclusive setting — that meant a user in
+// "first-visible" mode got no preview update on click, and a user in
+// "caret" mode got no preview update on wheel-scroll. With both
+// modes independent, either trigger fires the sync as long as that
+// mode is enabled.
+static intptr_t sLastCaretLine        = -1;
+static intptr_t sLastFirstVisibleLine = -1;
 static dispatch_block_t sPendingScroll = nil;
 
 static void syncScroll() {
@@ -1303,29 +1328,48 @@ static void syncScroll() {
     NppHandle h = getCurScintilla();
     if (!h) return;
 
-    intptr_t lineNo = 0;
-    if (sSettings.syncWithCaret) {
-        intptr_t pos = sci(h, SCI_GETCURRENTPOS);
-        lineNo = sci(h, SCI_LINEFROMPOSITION, (uintptr_t)pos);
-    } else if (sSettings.syncWithFirstVisibleLine) {
-        lineNo = sci(h, SCI_GETFIRSTVISIBLELINE);
-        lineNo = sci(h, SCI_DOCLINEFROMVISIBLE, (uintptr_t)lineNo);
+    intptr_t pos = sci(h, SCI_GETCURRENTPOS);
+    intptr_t caretLine = sci(h, SCI_LINEFROMPOSITION, (uintptr_t)pos);
+    intptr_t firstVisibleVis = sci(h, SCI_GETFIRSTVISIBLELINE);
+    intptr_t firstVisibleDoc = sci(h, SCI_DOCLINEFROMVISIBLE,
+                                    (uintptr_t)firstVisibleVis);
+
+    // Pick the change to react to. Caret takes priority when it has
+    // moved — that's the most direct "I'm interested in this line"
+    // signal (click, arrow keys, page-down). When the caret hasn't
+    // moved but the viewport has (mouse wheel, scrollbar drag), use
+    // first-visible. If neither moved, nothing to do.
+    intptr_t targetLine = -1;
+    BOOL caretMoved        = (sSettings.syncWithCaret           &&
+                              caretLine        != sLastCaretLine);
+    BOOL firstVisibleMoved = (sSettings.syncWithFirstVisibleLine &&
+                              firstVisibleDoc  != sLastFirstVisibleLine);
+
+    if (caretMoved) {
+        targetLine = caretLine;
+    } else if (firstVisibleMoved) {
+        targetLine = firstVisibleDoc;
     } else {
         return;
     }
 
-    if (lineNo == sLastSyncLine) return;
-    sLastSyncLine = lineNo;
+    // Refresh both trackers regardless of which one we picked, so a
+    // subsequent SCN_UPDATEUI doesn't fire a redundant scroll for a
+    // change that was already covered.
+    sLastCaretLine        = caretLine;
+    sLastFirstVisibleLine = firstVisibleDoc;
 
     // Debounce scroll commands — SCN_UPDATEUI fires very frequently
+    // (every paint, every selection change, every scroll tick).
     if (sPendingScroll) {
         dispatch_block_cancel(sPendingScroll);
         sPendingScroll = nil;
     }
-    intptr_t capturedLine = lineNo;
+    intptr_t capturedLine = targetLine;
     sPendingScroll = dispatch_block_create(DISPATCH_BLOCK_INHERIT_QOS_CLASS, ^{
         @autoreleasepool {
-            NSString *js = [NSString stringWithFormat:@"scrollToLine(%ld);", (long)capturedLine];
+            NSString *js = [NSString stringWithFormat:@"scrollToLine(%ld);",
+                                                       (long)capturedLine];
             [sWebView evaluateJavaScript:js completionHandler:nil];
         }
         sPendingScroll = nil;
@@ -1395,24 +1439,29 @@ static void togglePanel() {
     }
 }
 
+// The two sync modes are independent — click-to-caret AND wheel-to-
+// viewport can both be on simultaneously. Earlier versions made
+// them mutually exclusive, which left users in one of two broken
+// states (caret-only meant wheel scrolling didn't update the
+// preview; first-visible-only meant clicking to a new line didn't
+// update the preview). Each toggle now flips its own setting and
+// leaves the other alone.
 static void syncWithCaretCmd() {
     sSettings.syncWithCaret = !sSettings.syncWithCaret;
-    if (sSettings.syncWithCaret) sSettings.syncWithFirstVisibleLine = false;
     npp(NPPM_SETMENUITEMCHECK, (uintptr_t)funcItem[2]._cmdID, sSettings.syncWithCaret ? 1 : 0);
-    npp(NPPM_SETMENUITEMCHECK, (uintptr_t)funcItem[3]._cmdID, sSettings.syncWithFirstVisibleLine ? 1 : 0);
     saveSettings();
-    sLastSyncLine = -1;
-    if (sSettings.syncWithCaret) syncScroll();
+    sLastCaretLine        = -1;
+    sLastFirstVisibleLine = -1;
+    if (sSettings.syncWithCaret || sSettings.syncWithFirstVisibleLine) syncScroll();
 }
 
 static void syncWithFirstVisibleLineCmd() {
     sSettings.syncWithFirstVisibleLine = !sSettings.syncWithFirstVisibleLine;
-    if (sSettings.syncWithFirstVisibleLine) sSettings.syncWithCaret = false;
-    npp(NPPM_SETMENUITEMCHECK, (uintptr_t)funcItem[2]._cmdID, sSettings.syncWithCaret ? 1 : 0);
     npp(NPPM_SETMENUITEMCHECK, (uintptr_t)funcItem[3]._cmdID, sSettings.syncWithFirstVisibleLine ? 1 : 0);
     saveSettings();
-    sLastSyncLine = -1;
-    if (sSettings.syncWithFirstVisibleLine) syncScroll();
+    sLastCaretLine        = -1;
+    sLastFirstVisibleLine = -1;
+    if (sSettings.syncWithCaret || sSettings.syncWithFirstVisibleLine) syncScroll();
 }
 
 static void exportToHtmlCmd() {
@@ -1655,7 +1704,8 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
             if (sPanelVisible) {
                 sLastRenderedText.clear();
                 sCurrentFilePath.clear();
-                sLastSyncLine = -1;
+                sLastCaretLine        = -1;
+                sLastFirstVisibleLine = -1;
                 renderMarkdownDeferred();
 
                 // Auto-show/hide based on extension
