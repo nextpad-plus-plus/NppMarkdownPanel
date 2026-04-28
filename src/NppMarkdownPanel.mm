@@ -339,6 +339,26 @@ function renderMarkdown(md) {
 
   document.getElementById('content').innerHTML = html;
 
+  // Build the source-line → block-id map used by scrollToLine() for
+  // line-accurate forward scroll sync. The post-process regex above
+  // assigns block-N ids in DOM order; marked.lexer walks the source
+  // in the same order, so the indices match by construction. We
+  // validate that count just below — if they ever drift (raw <html>
+  // tokens whose first tag isn't in the regex's allowlist, etc.) we
+  // clear the map so scrollToLine() falls back to proportional math.
+  var newBlockMap = _buildBlockMap(md, content);
+  var actualBlockCount = document.querySelectorAll('[id^="block-"]').length;
+  if (newBlockMap.length === actualBlockCount && actualBlockCount > 0) {
+    window._blockMap = newBlockMap;
+  } else {
+    if (newBlockMap.length !== actualBlockCount) {
+      console.warn('[NppMarkdownPanel] blockMap/DOM mismatch (' +
+        newBlockMap.length + ' vs ' + actualBlockCount +
+        ') — falling back to proportional');
+    }
+    window._blockMap = [];
+  }
+
   // Syntax highlighting: let highlight.js find and process all code blocks
   if (typeof hljs !== 'undefined') {
     document.querySelectorAll('pre code').forEach(function(el) {
@@ -457,17 +477,126 @@ function highlightMatches(query) {
   return count;
 }
 
-// Scroll sync: proportional by document height (smooth, no jumping)
+// Scroll sync: block-level when the source-line/block-id map is
+// available, proportional fallback otherwise. The block-level path
+// gives line-accurate alignment even on documents with mixed block
+// heights (a tall H1 next to compact code fences next to long
+// paragraphs); the proportional path is the original implementation
+// and is used as a defensive fallback when the lexer/post-process
+// counts disagree.
+window._blockMap = [];
+
+// Walk top-level marked tokens to build [{line, id}, ...] entries
+// matching the post-process regex's block-N ids in source order.
+// Returns [] if the lexer throws — caller treats empty as "use
+// proportional fallback".
+function _buildBlockMap(md, content) {
+  // Source-line offset of the content body within md. Zero when
+  // there's no YAML front matter; otherwise the newline count of the
+  // "---\n...---\n" prefix that was stripped before marked.parse().
+  // syncScroll() native-side passes the editor's line number for the
+  // FULL source, so blockMap.line uses the same coordinate space.
+  var prefixLen = md.length - content.length;
+  var contentStartLine = 0;
+  if (prefixLen > 0) {
+    contentStartLine = (md.substring(0, prefixLen).match(/\n/g) || []).length;
+  }
+
+  var blockMap = [];
+  var blockIdx = 0;
+  var tokens;
+  try {
+    tokens = marked.lexer(content);
+  } catch (e) {
+    return [];
+  }
+
+  var cursor = contentStartLine;
+  tokens.forEach(function(tok) {
+    var lines = (tok.raw && tok.raw.match(/\n/g))
+                  ? tok.raw.match(/\n/g).length : 0;
+    // 'space' and 'def' tokens consume source lines but produce no
+    // block element in the rendered HTML — skip them so blockMap
+    // indices stay aligned with the post-process regex's block-N
+    // counter.
+    if (tok.type === 'space' || tok.type === 'def') {
+      cursor += lines;
+      return;
+    }
+    blockMap.push({ line: cursor, id: 'block-' + blockIdx });
+    blockIdx++;
+    cursor += lines;
+  });
+
+  return blockMap;
+}
+
+// Compute the target Y pixel for a given source line using the
+// blockMap. Returns a clamped value in [0, maxScroll]. Interpolates
+// between adjacent blocks so caret movement through a multi-line
+// block tracks smoothly instead of snapping at block boundaries.
+function _resolveBlockTargetY(lineNo, bm, maxScroll) {
+  // Binary search for the largest entry with line ≤ lineNo.
+  var lo = 0, hi = bm.length - 1, k = -1;
+  while (lo <= hi) {
+    var mid = (lo + hi) >> 1;
+    if (bm[mid].line <= lineNo) { k = mid; lo = mid + 1; }
+    else                         { hi = mid - 1; }
+  }
+  if (k < 0) return 0;   // caret is before the first mapped block
+                          // (e.g. inside front matter, which has no
+                          // entry today); top of preview is the
+                          // safest target.
+
+  var blockEl = document.getElementById(bm[k].id);
+  if (!blockEl) return 0;
+
+  var startY = blockEl.offsetTop;
+
+  // Interpolate between this block's top and the next block's top
+  // (or the document end for the last block) using the fraction of
+  // source lines between the blocks.
+  if (k + 1 < bm.length) {
+    var nextEl = document.getElementById(bm[k + 1].id);
+    if (nextEl) {
+      var lineSpan = bm[k + 1].line - bm[k].line;
+      if (lineSpan > 0) {
+        var t = Math.max(0, Math.min(1, (lineNo - bm[k].line) / lineSpan));
+        startY = startY + t * (nextEl.offsetTop - startY);
+      }
+    }
+  } else {
+    // Last block — interpolate toward maxScroll so the caret on the
+    // final source line lands at the bottom of the visible range.
+    var lineSpan = (window._totalLines - 1) - bm[k].line;
+    if (lineSpan > 0) {
+      var t = Math.max(0, Math.min(1, (lineNo - bm[k].line) / lineSpan));
+      startY = startY + t * (maxScroll - startY);
+    }
+  }
+
+  return Math.max(0, Math.min(maxScroll, Math.round(startY)));
+}
+
 var _scrollTimer = null;
 function scrollToLine(lineNo) {
   if (!window._totalLines || window._totalLines <= 1) return;
-  // Cancel any pending scroll to avoid fighting
+  // Cancel any pending scroll to avoid fighting fast caret movement.
   if (_scrollTimer) { clearTimeout(_scrollTimer); }
   _scrollTimer = setTimeout(function() {
-    var ratio = Math.max(0, Math.min(1, lineNo / (window._totalLines - 1)));
-    var maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-    var targetY = Math.round(ratio * maxScroll);
-    window.scrollTo({top: targetY, behavior: 'smooth'});
+    var maxScroll = Math.max(0,
+      document.documentElement.scrollHeight - window.innerHeight);
+    var targetY;
+    var bm = window._blockMap || [];
+    if (bm.length > 0) {
+      targetY = _resolveBlockTargetY(lineNo, bm, maxScroll);
+    } else {
+      // Proportional fallback (original implementation): used when the
+      // blockMap couldn't be built or its count disagreed with the DOM.
+      var ratio = Math.max(0, Math.min(1, lineNo / (window._totalLines - 1)));
+      targetY = Math.round(ratio * maxScroll);
+    }
+    window.scrollTo({ top: targetY, behavior: 'smooth' });
     _scrollTimer = null;
   }, 50);
 }
