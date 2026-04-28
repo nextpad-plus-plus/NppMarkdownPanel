@@ -486,16 +486,31 @@ function highlightMatches(query) {
 // counts disagree.
 window._blockMap = [];
 
-// Walk top-level marked tokens to build [{line, id}, ...] entries
-// matching the post-process regex's block-N ids in source order.
-// Returns [] if the lexer throws — caller treats empty as "use
-// proportional fallback".
+// Walk marked's token tree to build [{line, id}, ...] entries that
+// match the post-process regex's block-N ids one-for-one. The
+// regex matches every <h1-6|p|pre|ul|ol|table|blockquote|hr> opening
+// tag in DOM order; the walker emits one entry per token that
+// produces such a tag. Two cases that aren't immediately obvious
+// from the top-level token list and need recursion:
+//
+//   1) Loose lists (`tok.type === 'list' && tok.loose === true`).
+//      Each item's content is wrapped in <p> in the rendered HTML
+//      — that <p> matches the regex and gets a block-N id. The
+//      child token inside a loose item is usually a 'text' token
+//      (not 'paragraph'), so we treat it specially. Items with
+//      multiple block children (e.g. a paragraph followed by a
+//      code fence) get one entry per child.
+//
+//   2) Blockquotes. Their child tokens render with their own tags
+//      (<p>, <h*>, <pre>, etc.) and each matches the regex.
+//
+// Without the recursion, blockMap is ~21 short on a 1300-line file
+// with several loose lists; the validation gate then clears the
+// map and scroll-sync falls back to proportional, defeating the
+// whole point of this code.
+//
+// Returns [] if the lexer throws.
 function _buildBlockMap(md, content) {
-  // Source-line offset of the content body within md. Zero when
-  // there's no YAML front matter; otherwise the newline count of the
-  // "---\n...---\n" prefix that was stripped before marked.parse().
-  // syncScroll() native-side passes the editor's line number for the
-  // FULL source, so blockMap.line uses the same coordinate space.
   var prefixLen = md.length - content.length;
   var contentStartLine = 0;
   if (prefixLen > 0) {
@@ -511,23 +526,58 @@ function _buildBlockMap(md, content) {
     return [];
   }
 
-  var cursor = contentStartLine;
-  tokens.forEach(function(tok) {
-    var lines = (tok.raw && tok.raw.match(/\n/g))
-                  ? tok.raw.match(/\n/g).length : 0;
-    // 'space' and 'def' tokens consume source lines but produce no
-    // block element in the rendered HTML — skip them so blockMap
-    // indices stay aligned with the post-process regex's block-N
-    // counter.
-    if (tok.type === 'space' || tok.type === 'def') {
-      cursor += lines;
-      return;
-    }
-    blockMap.push({ line: cursor, id: 'block-' + blockIdx });
-    blockIdx++;
-    cursor += lines;
-  });
+  // Token types whose top-level rendering produces a regex-matching tag.
+  var BLOCK_TYPES = {
+    heading: 1, paragraph: 1, code: 1, list: 1,
+    table: 1, blockquote: 1, hr: 1
+  };
 
+  function rawNewlines(tok) {
+    return (tok && tok.raw && tok.raw.match(/\n/g))
+             ? tok.raw.match(/\n/g).length : 0;
+  }
+
+  function walk(toks, lineCursor, insideLooseListItem) {
+    if (!toks) return;
+    for (var i = 0; i < toks.length; i++) {
+      var tok = toks[i];
+      var lines = rawNewlines(tok);
+      var startLine = lineCursor;
+
+      if (tok.type === 'space' || tok.type === 'def') {
+        lineCursor += lines;
+        continue;
+      }
+
+      if (BLOCK_TYPES[tok.type]) {
+        blockMap.push({ line: startLine, id: 'block-' + blockIdx });
+        blockIdx++;
+      } else if (insideLooseListItem && tok.type === 'text') {
+        // Loose-list items wrap their first text token in a <p> in
+        // the DOM, even though marked emits a 'text' token rather
+        // than 'paragraph' for them.
+        blockMap.push({ line: startLine, id: 'block-' + blockIdx });
+        blockIdx++;
+      }
+
+      // Recurse for containers whose children produce regex-matching tags.
+      if (tok.type === 'blockquote' && tok.tokens) {
+        walk(tok.tokens, startLine, false);
+      }
+      if (tok.type === 'list' && tok.loose && tok.items) {
+        var itemLineCursor = startLine;
+        for (var j = 0; j < tok.items.length; j++) {
+          var item = tok.items[j];
+          if (item.tokens) walk(item.tokens, itemLineCursor, true);
+          itemLineCursor += rawNewlines(item);
+        }
+      }
+
+      lineCursor += lines;
+    }
+  }
+
+  walk(tokens, contentStartLine, false);
   return blockMap;
 }
 
