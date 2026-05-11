@@ -20,7 +20,7 @@ target_link_libraries(NppMarkdownPanel PRIVATE
     "-framework WebKit"
     "-framework UniformTypeIdentifiers")
 set_target_properties(NppMarkdownPanel PROPERTIES PREFIX "" SUFFIX ".dylib")
-set(PLUGIN_INSTALL_DIR "$ENV{HOME}/.notepad++/plugins/NppMarkdownPanel")
+set(PLUGIN_INSTALL_DIR "$ENV{HOME}/.nextpad++/plugins/NppMarkdownPanel")
 install(TARGETS NppMarkdownPanel DESTINATION "${PLUGIN_INSTALL_DIR}")
 # Vendor JS/CSS/icons + help.md the runtime reads from <dylib_dir>/resources/.
 # Without this `make install` only deploys the dylib and the plugin fails

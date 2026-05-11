@@ -684,7 +684,7 @@ static std::string getConfigPath() {
     if (buf[0] != '\0') {
         dir = [NSString stringWithUTF8String:buf];
     } else {
-        dir = [NSHomeDirectory() stringByAppendingPathComponent:@".notepad++"];
+        dir = [NSHomeDirectory() stringByAppendingPathComponent:@".nextpad++"];
     }
     return std::string([dir UTF8String]) + "/NppMarkdownPanel.json";
 }
